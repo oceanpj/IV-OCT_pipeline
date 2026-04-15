@@ -69,7 +69,7 @@ NUM_EPOCHS    = 60
 LR            = 3e-4
 VAL_SPLIT     = 0.2       # 20% of frames held out for validation
 EARLY_STOP    = 12        # stop if val Dice doesn't improve for this many epochs
-MASK_KEY      = 'union'   # 'union' | '1' | '2'  — which annotator(s) to use
+MASK_KEY      = '1'       # only key present in mask.h5
 MAX_FRAMES    = 156       # only use frames 0–155 (set to None to use all)
 DEVICE        = (
     "mps"  if torch.backends.mps.is_available() else   # Apple Silicon
@@ -96,10 +96,7 @@ def load_dicom_gray(path, max_frames=MAX_FRAMES):
 def load_mask(path, key=MASK_KEY, max_frames=MAX_FRAMES):
     """Return (N, H, W) float32 binary mask. Caps at max_frames if set."""
     with h5py.File(path, 'r') as f:
-        if key == 'union':
-            m = np.logical_or(f['1'][()], f['2'][()]).astype(np.float32)
-        else:
-            m = (f[key][()] > 0).astype(np.float32)
+        m = (f[key][()] > 0).astype(np.float32)
     if max_frames is not None:
         m = m[:max_frames]
     return m
@@ -374,12 +371,10 @@ def infer(model, dcm_path, out_h5_path):
             if i % 50 == 0:
                 print(f"  frame {i:3d}/{n}  lumen px = {pred_volume[i].sum()}")
 
-    # Save in identical format to the training mask.h5
-    # Keys '1' and '2' both get the same prediction (single-model output)
+    # Save in identical format to the training mask.h5 (key '1' only)
     os.makedirs(os.path.dirname(out_h5_path), exist_ok=True)
     with h5py.File(out_h5_path, 'w') as f:
         f.create_dataset('1', data=pred_volume, dtype=np.int8, compression='gzip')
-        f.create_dataset('2', data=pred_volume, dtype=np.int8, compression='gzip')
 
     print(f"Mask saved → {out_h5_path}")
     print(f"  Volume shape : {pred_volume.shape}")
