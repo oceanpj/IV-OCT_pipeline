@@ -43,19 +43,15 @@ import torchvision.transforms.functional as TF
 import random
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Paths
+#  Paths  —  folders are auto-scanned for volumes
 # ══════════════════════════════════════════════════════════════════════════════
 
-TRAIN_DCM  = ("/Users/oceanpunsalan/Data/Intravascular/Analysis/"
-              "0B360D4D-3B16-4DCC-AD86-32361D1B47A9/"
-              "0B360D4D-3B16-4DCC-AD86-32361D1B47A9.dcm")
-TRAIN_MASK = ("/Users/oceanpunsalan/Data/Intravascular/Analysis/"
-              "0B360D4D-3B16-4DCC-AD86-32361D1B47A9/mask.h5")
-TEST_DCM   = ("/Users/oceanpunsalan/Data/Intravascular/Analysis/"
-              "137D983E-2D45-4C63-AA65-5DC75F6860B5/"
-              "137D983E-2D45-4C63-AA65-5DC75F6860B5.dcm")
-TEST_OUT   = ("/Users/oceanpunsalan/Data/Intravascular/Analysis/"
-              "137D983E-2D45-4C63-AA65-5DC75F6860B5/mask.h5")
+TRAIN_DIR = r"Y:\Eye\Ocean\Intravascular\IV-OCT_pipeline\Lumen_Training"
+TEST_DIR  = r"Y:\Eye\Ocean\Intravascular\IV-OCT_pipeline\Lumen_Testing"
+
+# Expected format in TRAIN_DIR : <name>.dcm  +  <name>_mask.h5
+# Expected format in TEST_DIR  : <name>.dcm  (mask will be written as <name>_mask.h5)
+
 CKPT_DIR   = "checkpoints"
 CKPT_PATH  = os.path.join(CKPT_DIR, "unet_lumen.pth")
 
@@ -70,7 +66,10 @@ LR            = 3e-4
 VAL_SPLIT     = 0.2       # 20% of frames held out for validation
 EARLY_STOP    = 12        # stop if val Dice doesn't improve for this many epochs
 MASK_KEY      = '1'       # only key present in mask.h5
-MAX_FRAMES    = 156       # only use frames 0–155 (set to None to use all)
+# annotated-frame detection: any frame whose mask has ≥ this many positive
+# pixels is considered annotated and used for training.  Frames that are
+# entirely zero get skipped automatically.
+MIN_MASK_PIXELS = 1
 DEVICE        = (
     "mps"  if torch.backends.mps.is_available() else   # Apple Silicon
     "cuda" if torch.cuda.is_available()         else
@@ -81,25 +80,93 @@ DEVICE        = (
 #  Data loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_dicom_gray(path, max_frames=MAX_FRAMES):
-    """Return (N, H, W) float32 in [0, 1]. Caps at max_frames if set."""
-    px = pydicom.dcmread(path).pixel_array          # (N, H, W, 3) uint8
-    if max_frames is not None:
-        px = px[:max_frames]
-    gray = np.stack(
-        [cv2.cvtColor(px[i], cv2.COLOR_RGB2GRAY) for i in range(px.shape[0])],
-        axis=0
-    ).astype(np.float32) / 255.0
-    return gray
+def load_dicom_gray(path):
+    """Return (N, H, W) float32 grayscale volume in [0, 1]."""
+    px = pydicom.dcmread(path).pixel_array                # (N, H, W, 3) uint8
+    if px.ndim == 4 and px.shape[-1] == 3:
+        gray = np.stack(
+            [cv2.cvtColor(px[i], cv2.COLOR_RGB2GRAY) for i in range(px.shape[0])],
+            axis=0
+        )
+    else:
+        gray = px
+    return gray.astype(np.float32) / 255.0
 
 
-def load_mask(path, key=MASK_KEY, max_frames=MAX_FRAMES):
-    """Return (N, H, W) float32 binary mask. Caps at max_frames if set."""
+def load_mask(path, key=MASK_KEY):
+    """Return (N, H, W) float32 binary mask."""
     with h5py.File(path, 'r') as f:
-        m = (f[key][()] > 0).astype(np.float32)
-    if max_frames is not None:
-        m = m[:max_frames]
-    return m
+        return (f[key][()] > 0).astype(np.float32)
+
+
+def discover_training_pairs(train_dir):
+    """
+    Return list of (dcm_path, mask_path) tuples for every <name>.dcm in
+    train_dir that has a matching <name>_mask.h5 sibling.
+    """
+    pairs = []
+    for fname in sorted(os.listdir(train_dir)):
+        if not fname.lower().endswith('.dcm'):
+            continue
+        stem     = os.path.splitext(fname)[0]
+        dcm_p    = os.path.join(train_dir, fname)
+        mask_p   = os.path.join(train_dir, stem + '_mask.h5')
+        if os.path.exists(mask_p):
+            pairs.append((dcm_p, mask_p))
+        else:
+            print(f"  WARN: no mask found for {fname} — skipping")
+    return pairs
+
+
+def build_training_set(train_dir):
+    """
+    Load every <name>.dcm + <name>_mask.h5 pair from train_dir.
+    Keep ONLY frames that are annotated (mask has >= MIN_MASK_PIXELS positives).
+
+    Returns
+    -------
+    images : (K, H, W) float32
+    masks  : (K, H, W) float32
+    where K = total annotated frames across all training volumes.
+    """
+    pairs = discover_training_pairs(train_dir)
+    if not pairs:
+        raise RuntimeError(f"No (.dcm, _mask.h5) pairs found in {train_dir}")
+
+    all_imgs, all_masks = [], []
+    for dcm_p, mask_p in pairs:
+        name = os.path.basename(dcm_p)
+        print(f"  loading {name}")
+        imgs = load_dicom_gray(dcm_p)                     # (N, H, W)
+        mks  = load_mask(mask_p)                          # (M, H, W)
+
+        # If the mask covers fewer frames than the DICOM, pad with zeros so
+        # shapes align (unannotated frames will then be filtered out below).
+        if mks.shape[0] < imgs.shape[0]:
+            pad = np.zeros((imgs.shape[0] - mks.shape[0],
+                            mks.shape[1], mks.shape[2]), dtype=mks.dtype)
+            mks = np.concatenate([mks, pad], axis=0)
+        elif mks.shape[0] > imgs.shape[0]:
+            mks = mks[:imgs.shape[0]]
+
+        # Keep only frames that actually have an annotation
+        has_ann = mks.reshape(mks.shape[0], -1).sum(axis=1) >= MIN_MASK_PIXELS
+        n_ann   = int(has_ann.sum())
+        print(f"    frames={imgs.shape[0]}  annotated={n_ann}  "
+              f"({100*n_ann/imgs.shape[0]:.0f}%)")
+
+        all_imgs.append(imgs[has_ann])
+        all_masks.append(mks[has_ann])
+
+    images = np.concatenate(all_imgs,  axis=0)
+    masks  = np.concatenate(all_masks, axis=0)
+    return images, masks
+
+
+def discover_test_volumes(test_dir):
+    """Return list of absolute paths to every .dcm in test_dir."""
+    return [os.path.join(test_dir, f) for f in sorted(os.listdir(test_dir))
+            if f.lower().endswith('.dcm')]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -350,36 +417,38 @@ def save_curves(history):
 #  Inference
 # ══════════════════════════════════════════════════════════════════════════════
 
-def infer(model, dcm_path, out_h5_path):
-    """Run inference on a full DICOM volume and save mask.h5."""
+def infer_volume(model, dcm_path):
+    """
+    Run inference on every frame of dcm_path and save
+        <same_folder>/<dcm_stem>_mask.h5
+    with key '1' matching the training mask.h5 format.
+    """
     model.eval()
-    model.to(DEVICE)
 
-    print(f"\nInference on : {dcm_path}")
-    images = load_dicom_gray(dcm_path)         # (N, H, W) float32
+    stem         = os.path.splitext(os.path.basename(dcm_path))[0]
+    out_h5_path  = os.path.join(os.path.dirname(dcm_path), f"{stem}_mask.h5")
+
+    print(f"\n── {os.path.basename(dcm_path)} ──")
+    images = load_dicom_gray(dcm_path)                # (N, H, W) float32
     n = images.shape[0]
-    pred_volume = np.zeros(images.shape, dtype=np.int8)
+    pred = np.zeros(images.shape, dtype=np.int8)
 
     with torch.no_grad():
         for i in range(n):
-            img = torch.from_numpy(images[i]).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-            img = img.to(DEVICE)
-            logit = model(img)                          # (1,1,H,W)
+            img = torch.from_numpy(images[i]).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            logit = model(img)
             prob  = torch.sigmoid(logit).squeeze().cpu().numpy()
-            pred_volume[i] = (prob > 0.5).astype(np.int8)
+            pred[i] = (prob > 0.5).astype(np.int8)
 
             if i % 50 == 0:
-                print(f"  frame {i:3d}/{n}  lumen px = {pred_volume[i].sum()}")
+                print(f"  frame {i:3d}/{n}  lumen px = {pred[i].sum()}")
 
-    # Save in identical format to the training mask.h5 (key '1' only)
-    os.makedirs(os.path.dirname(out_h5_path), exist_ok=True)
     with h5py.File(out_h5_path, 'w') as f:
-        f.create_dataset('1', data=pred_volume, dtype=np.int8, compression='gzip')
+        f.create_dataset('1', data=pred, dtype=np.int8, compression='gzip')
 
-    print(f"Mask saved → {out_h5_path}")
-    print(f"  Volume shape : {pred_volume.shape}")
-    print(f"  Positive voxels : {pred_volume.sum()} / {pred_volume.size} "
-          f"({100*pred_volume.mean():.1f}%)")
+    print(f"  saved → {out_h5_path}")
+    print(f"  positive voxels : {pred.sum()} / {pred.size} "
+          f"({100*pred.mean():.1f}%)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -392,13 +461,13 @@ def main(infer_only=False):
     if not infer_only:
         print("=" * 60)
         print("LOADING TRAINING DATA")
+        print(f"  dir: {TRAIN_DIR}")
         print("=" * 60)
-        images = load_dicom_gray(TRAIN_DCM)
-        masks  = load_mask(TRAIN_MASK, key=MASK_KEY)
-        print(f"Images : {images.shape}   range [{images.min():.2f}, {images.max():.2f}]")
-        print(f"Masks  : {masks.shape}    positives = {masks.mean()*100:.1f}%\n")
+        images, masks = build_training_set(TRAIN_DIR)
+        print(f"\nTotal annotated slices : {len(images)}   "
+              f"shape = {images.shape}")
+        print(f"Positive pixel fraction : {masks.mean()*100:.2f}%\n")
 
-        # Train / val split (stratified by frame index for even coverage)
         idx = np.arange(len(images))
         train_idx, val_idx = train_test_split(idx, test_size=VAL_SPLIT,
                                               random_state=42, shuffle=True)
@@ -421,12 +490,20 @@ def main(infer_only=False):
         raise FileNotFoundError(f"No checkpoint found at {CKPT_PATH}. "
                                 f"Run without --infer first to train.")
     model.load_state_dict(torch.load(CKPT_PATH, map_location=DEVICE))
+    model.to(DEVICE)
     print(f"\nLoaded weights from {CKPT_PATH}")
 
     print("=" * 60)
     print("INFERENCE")
+    print(f"  dir: {TEST_DIR}")
     print("=" * 60)
-    infer(model, TEST_DCM, TEST_OUT)
+    test_volumes = discover_test_volumes(TEST_DIR)
+    if not test_volumes:
+        print(f"(no .dcm files found in {TEST_DIR})")
+        return
+    for dcm_path in test_volumes:
+        infer_volume(model, dcm_path)
+    print("\nAll done.")
 
 
 if __name__ == "__main__":
